@@ -1,0 +1,62 @@
+# kubectl apply -f deploy/kubernetes.yaml   (edit the targets ConfigMap first)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: netprobe-targets
+data:
+  targets.txt: |
+    # one target per line
+    https://github.com
+    tls://smtp.gmail.com:465
+    tcp://kubernetes.default.svc:443
+    dns://kubernetes.default.svc.cluster.local
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: netprobe
+  labels: { app: netprobe }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: netprobe }
+  template:
+    metadata:
+      labels: { app: netprobe }
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9115"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: netprobe
+          image: ghcr.io/esmeabha/netprobe:latest
+          ports: [{ name: metrics, containerPort: 9115 }]
+          readinessProbe:
+            httpGet: { path: /healthz, port: metrics }
+          livenessProbe:
+            httpGet: { path: /healthz, port: metrics }
+            periodSeconds: 20
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+            limits: { memory: 64Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: config, mountPath: /config, readOnly: true }
+      volumes:
+        - name: config
+          configMap: { name: netprobe-targets }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: netprobe
+  labels: { app: netprobe }
+spec:
+  selector: { app: netprobe }
+  ports: [{ name: metrics, port: 9115, targetPort: metrics }]

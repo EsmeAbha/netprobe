@@ -1,0 +1,37 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+      - run: go vet ./...
+      - run: go test -race -count=1 ./...
+      - name: Known vulnerabilities in dependencies and the Go standard library
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+      - name: Cross-compile
+        run: |
+          for target in linux/amd64 linux/arm64 darwin/arm64 windows/amd64; do
+            GOOS=${target%/*} GOARCH=${target#*/} CGO_ENABLED=0 go build -o /dev/null ./cmd/netprobe
+          done
+  alert-rules:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker run --rm -v "$PWD:/w" -w /w --entrypoint promtool prom/prometheus:v2.54.1 check rules deploy/alerts.yaml
+  image:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t netprobe:ci .
+      - name: Image runs and answers health checks
+        run: |
+          docker run -d --name np -p 9115:9115 netprobe:ci serve -listen :9115 https://github.com
+          for i in $(seq 1 20); do curl -sf localhost:9115/healthz && break; sleep 0.5; done
+          curl -sf localhost:9115/metrics | grep netprobe_up

@@ -1,0 +1,33 @@
+# Prometheus alert rules for netprobe. Validate: promtool check rules deploy/alerts.yaml
+groups:
+  - name: netprobe
+    rules:
+      - alert: ProbeFailing
+        expr: max_over_time(netprobe_up[5m]) == 0
+        for: 2m
+        labels: { severity: page }
+        annotations:
+          summary: "{{ $labels.target }} has failed every probe for 5m (failing phase: {{ $labels.failed_phase }})"
+      - alert: ProbeFlapping
+        expr: avg_over_time(netprobe_up[15m]) < 0.9 and avg_over_time(netprobe_up[15m]) > 0
+        for: 10m
+        labels: { severity: ticket }
+        annotations:
+          summary: "{{ $labels.target }} fails intermittently ({{ $value | humanizePercentage }} success over 15m)"
+      - alert: TLSCertificateExpiringSoon
+        expr: netprobe_tls_cert_expiry_days < 14
+        for: 1h
+        labels: { severity: ticket }
+        annotations:
+          summary: "Certificate for {{ $labels.target }} ({{ $labels.subject }}) expires in {{ $value | printf \"%.0f\" }} days"
+      - alert: TLSCertificateExpiryCritical
+        expr: netprobe_tls_cert_expiry_days < 3
+        labels: { severity: page }
+        annotations:
+          summary: "Certificate for {{ $labels.target }} expires in under 3 days"
+      - alert: SlowTimeToFirstByte
+        expr: avg_over_time(netprobe_phase_seconds{phase="ttfb"}[10m]) > 1
+        for: 10m
+        labels: { severity: ticket }
+        annotations:
+          summary: "{{ $labels.target }} server response is slow (avg TTFB {{ $value | humanizeDuration }})"
