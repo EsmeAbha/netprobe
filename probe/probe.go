@@ -20,6 +20,7 @@ import (
 	"net/http/httptrace"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -141,28 +142,51 @@ func probeConn(ctx context.Context, hostport string, withTLS bool, opt Options, 
 }
 
 func probeHTTP(ctx context.Context, u *url.URL, opt Options, r *Result) {
+	// trace callbacks run on the transport's goroutines (and can fire after Do returns),
+	// so they write to a local map under a lock that is copied into the result at the end
+	var mu sync.Mutex
+	phases := map[string]time.Duration{}
+	var remote string
 	var dnsStart, connStart, tlsStart, reqStart time.Time
+	set := func(name string, since time.Time) {
+		mu.Lock()
+		phases[name] = time.Since(since)
+		mu.Unlock()
+	}
+	collect := func() {
+		mu.Lock()
+		defer mu.Unlock()
+		for k, v := range phases {
+			r.Phases[k] = v
+		}
+		r.RemoteAddr = remote
+	}
 	trace := &httptrace.ClientTrace{
-		DNSStart:     func(httptrace.DNSStartInfo) { dnsStart = time.Now() },
-		DNSDone:      func(httptrace.DNSDoneInfo) { r.Phases["dns"] = time.Since(dnsStart) },
-		ConnectStart: func(_, _ string) { connStart = time.Now() },
-		// a phase is only recorded when it succeeds, so failedPhase can tell where things broke
+		DNSStart:     func(httptrace.DNSStartInfo) { mu.Lock(); dnsStart = time.Now(); mu.Unlock() },
+		DNSDone:      func(httptrace.DNSDoneInfo) { set("dns", dnsStart) },
+		ConnectStart: func(_, _ string) { mu.Lock(); connStart = time.Now(); mu.Unlock() },
+		// a phase is only recorded when it succeeds
 		ConnectDone: func(_, addr string, err error) {
 			if err == nil {
-				r.Phases["connect"] = time.Since(connStart)
-				r.RemoteAddr = addr
+				set("connect", connStart)
+				mu.Lock()
+				remote = addr
+				mu.Unlock()
 			}
 		},
-		TLSHandshakeStart: func() { tlsStart = time.Now() },
+		TLSHandshakeStart: func() { mu.Lock(); tlsStart = time.Now(); mu.Unlock() },
 		TLSHandshakeDone: func(_ tls.ConnectionState, err error) {
 			if err == nil {
-				r.Phases["tls"] = time.Since(tlsStart)
+				set("tls", tlsStart)
 			}
 		},
-		WroteRequest: func(httptrace.WroteRequestInfo) { reqStart = time.Now() },
+		WroteRequest: func(httptrace.WroteRequestInfo) { mu.Lock(); reqStart = time.Now(); mu.Unlock() },
 		GotFirstResponseByte: func() {
-			if !reqStart.IsZero() {
-				r.Phases["ttfb"] = time.Since(reqStart)
+			mu.Lock()
+			started := reqStart
+			mu.Unlock()
+			if !started.IsZero() {
+				set("ttfb", started)
 			}
 		},
 	}
@@ -179,9 +203,10 @@ func probeHTTP(ctx context.Context, u *url.URL, opt Options, r *Result) {
 	req, _ := http.NewRequestWithContext(httptrace.WithClientTrace(ctx, trace), http.MethodGet, u.String(), nil)
 	req.Header.Set("User-Agent", "netprobe/1.0")
 	resp, err := client.Do(req)
+	collect()
 	if err != nil {
 		r.Error = explain(err)
-		r.FailedPhase = failedPhase(r.Phases, u.Scheme == "https")
+		r.FailedPhase = failedPhase(err, r.Phases, u.Scheme == "https")
 		return
 	}
 	defer resp.Body.Close()
@@ -211,8 +236,21 @@ func recordTLS(cs tls.ConnectionState, r *Result) {
 	}
 }
 
-// failedPhase infers which phase an HTTP error happened in from the phases that completed.
-func failedPhase(p map[string]time.Duration, https bool) string {
+// failedPhase decides which phase an HTTP error happened in: from the error type when it is
+// unambiguous, otherwise from which phases completed (timeouts can strike in any phase).
+func failedPhase(err error, p map[string]time.Duration, https bool) string {
+	var dnsErr *net.DNSError
+	var opErr *net.OpError
+	var certErr *tls.CertificateVerificationError
+	var recErr tls.RecordHeaderError
+	switch {
+	case errors.As(err, &dnsErr):
+		return "dns"
+	case errors.As(err, &certErr), errors.As(err, &recErr), strings.Contains(err.Error(), "tls:"):
+		return "tls"
+	case errors.As(err, &opErr) && opErr.Op == "dial":
+		return "connect"
+	}
 	switch {
 	case p["dns"] == 0 && p["connect"] == 0:
 		return "dns"
